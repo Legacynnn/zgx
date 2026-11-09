@@ -311,6 +311,32 @@ fn main() {
     );
     assert!(left_out.is_empty(), "left out: {left_out:?}");
     println!("d3d11_left_out: {left_out:?}");
+
+    // Continuous corners (off unless a box asks): drawn, as the circular box
+    // it would otherwise be, and the one thing left out.
+    let continuous = draw(|scene, id| {
+        scene.set_kind(
+            id,
+            NodeKind::Panel {
+                layout: Layout::Overlay,
+                quad: QuadStyle {
+                    radius: 8.,
+                    fill: FILL,
+                    decoration: Some(std::sync::Arc::new(zgx::decoration::Decoration {
+                        corner_curve: zgx::decoration::CornerCurve::Continuous,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            },
+        )
+    })
+    .expect("a frame with continuous corners draws");
+    assert!(continuous == plain, "drawn as the circular box it would be");
+    assert_eq!(
+        GpuRenderer::debug_d3d11_left_out(),
+        ["continuous corners (drawn circular)"]
+    );
 }
 
 #[cfg(not(windows))]
