@@ -399,6 +399,25 @@ impl GroupFrame {
             content,
         }
     }
+    // A builder for each field, named as the field is.
+    /// With this `left` (see the field).
+    #[must_use]
+    pub fn left(mut self, left: impl Into<Option<f32>>) -> Self {
+        self.left = left.into();
+        self
+    }
+    /// With this `width` (see the field).
+    #[must_use]
+    pub fn width(mut self, width: impl Into<Option<f32>>) -> Self {
+        self.width = width.into();
+        self
+    }
+    /// With this `content` (see the field).
+    #[must_use]
+    pub fn content(mut self, content: impl Into<Option<f32>>) -> Self {
+        self.content = content.into();
+        self
+    }
 }
 /// Each line's room (`LineInset`), given its index, its text and what the
 /// line before it left its highlighter (`Highlighter`'s state; 0 for the
@@ -452,6 +471,60 @@ pub struct LineMark {
     /// code block's wash and line numbers): only the text, and the marks not
     /// pinned, move.
     pub pinned: bool,
+    /// A picture filling it (a note's image above its caption), its corners
+    /// rounded by `radius`: a negative `y` puts it in its line's room above.
+    pub image: Option<MarkImage>,
+    /// Where it sits across the line's width (left, centre or right; `x`
+    /// then offsets it); none: at `x` (or from the right edge with
+    /// `from_right`).
+    pub align: Option<crate::text_layout::TextAlign>,
+    /// A picture drawn as given in its box, in place of its fill and border.
+    pub svg: Option<Arc<crate::svg::SvgData>>,
+    /// Per-side borders and per-corner radii (a table's outer cells), over
+    /// `radius` and `border_width`.
+    pub decoration: Option<Arc<crate::decoration::Decoration>>,
+    /// Turned this far clockwise about its centre, in degrees (a toggle's
+    /// chevron, 90 open): a change eases there over `motion.duration.fast`,
+    /// easing out, unless the system reduces motion.
+    pub rotate: f32,
+}
+/// A line mark's picture (`LineMark::image`): decoded pixels and how they
+/// fit the mark's box. A file is decoded by the app, as an image view's is
+/// (`zgx_gpu::assets::decode_image_kept`), and kept in its `ImageCache`.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkImage {
+    /// The pixels.
+    pub image: Arc<crate::image::ImageData>,
+    /// How they fit the mark's box
+    /// ([`ObjectFit::Cover`](crate::style::ObjectFit::Cover): filling it,
+    /// cropped).
+    pub fit: crate::style::ObjectFit,
+}
+impl MarkImage {
+    /// `image`, fitting the mark's box as `fit`.
+    pub fn new(image: Arc<crate::image::ImageData>, fit: crate::style::ObjectFit) -> Self {
+        Self { image, fit }
+    }
+    /// With this `image` (see the field).
+    #[must_use]
+    pub fn image(mut self, image: Arc<crate::image::ImageData>) -> Self {
+        self.image = image;
+        self
+    }
+    /// With this `fit` (see the field).
+    #[must_use]
+    pub fn fit(mut self, fit: crate::style::ObjectFit) -> Self {
+        self.fit = fit;
+        self
+    }
+    /// `image` filling the mark, cropped to its box.
+    pub fn cover(image: Arc<crate::image::ImageData>) -> Self {
+        Self {
+            image,
+            fit: crate::style::ObjectFit::Cover,
+        }
+    }
 }
 impl Default for LineMark {
     fn default() -> Self {
@@ -471,6 +544,11 @@ impl Default for LineMark {
             tabular: false,
             over_text: false,
             pinned: false,
+            image: None,
+            align: None,
+            svg: None,
+            decoration: None,
+            rotate: 0.,
         }
     }
 }
@@ -486,6 +564,131 @@ impl LineMark {
             fill,
             ..Self::default()
         }
+    }
+    // A builder for each field, named as the field is: the struct gains
+    // fields, so code outside sets them so.
+    /// With this `x` (see the field).
+    #[must_use]
+    pub fn x(mut self, x: f32) -> Self {
+        self.x = x;
+        self
+    }
+    /// With this `y` (see the field).
+    #[must_use]
+    pub fn y(mut self, y: f32) -> Self {
+        self.y = y;
+        self
+    }
+    /// With this `width` (see the field).
+    #[must_use]
+    pub fn width(mut self, width: f32) -> Self {
+        self.width = width;
+        self
+    }
+    /// With this `height` (see the field).
+    #[must_use]
+    pub fn height(mut self, height: f32) -> Self {
+        self.height = height;
+        self
+    }
+    /// With this `bottom` (see the field).
+    #[must_use]
+    pub fn bottom(mut self, bottom: f32) -> Self {
+        self.bottom = bottom;
+        self
+    }
+    /// With this `fill` (see the field).
+    #[must_use]
+    pub fn fill(mut self, fill: crate::scene::Color) -> Self {
+        self.fill = fill;
+        self
+    }
+    /// With this `radius` (see the field).
+    #[must_use]
+    pub fn radius(mut self, radius: f32) -> Self {
+        self.radius = radius;
+        self
+    }
+    /// With this `border_color` (see the field).
+    #[must_use]
+    pub fn border_color(mut self, border_color: crate::scene::Color) -> Self {
+        self.border_color = border_color;
+        self
+    }
+    /// With this `border_width` (see the field).
+    #[must_use]
+    pub fn border_width(mut self, border_width: f32) -> Self {
+        self.border_width = border_width;
+        self
+    }
+    /// With this `from_right` (see the field).
+    #[must_use]
+    pub fn from_right(mut self, from_right: bool) -> Self {
+        self.from_right = from_right;
+        self
+    }
+    /// With this `mono` (see the field).
+    #[must_use]
+    pub fn mono(mut self, mono: bool) -> Self {
+        self.mono = mono;
+        self
+    }
+    /// With this `label` (see the field).
+    #[must_use]
+    pub fn label(mut self, label: impl Into<Option<(Arc<str>, crate::scene::Color, f32)>>) -> Self {
+        self.label = label.into();
+        self
+    }
+    /// With this `image` (see the field).
+    #[must_use]
+    pub fn image(mut self, image: impl Into<Option<MarkImage>>) -> Self {
+        self.image = image.into();
+        self
+    }
+    /// With this `align` (see the field).
+    #[must_use]
+    pub fn align(mut self, align: impl Into<Option<crate::text_layout::TextAlign>>) -> Self {
+        self.align = align.into();
+        self
+    }
+    /// With this `svg` (see the field).
+    #[must_use]
+    pub fn svg(mut self, svg: impl Into<Option<Arc<crate::svg::SvgData>>>) -> Self {
+        self.svg = svg.into();
+        self
+    }
+    /// With this `decoration` (see the field).
+    #[must_use]
+    pub fn decoration(
+        mut self,
+        decoration: impl Into<Option<Arc<crate::decoration::Decoration>>>,
+    ) -> Self {
+        self.decoration = decoration.into();
+        self
+    }
+    /// With this `pinned` (see the field).
+    #[must_use]
+    pub fn pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
+        self
+    }
+    /// With this `over_text` (see the field).
+    #[must_use]
+    pub fn over_text(mut self, over_text: bool) -> Self {
+        self.over_text = over_text;
+        self
+    }
+    /// With this `rotate` (see the field).
+    #[must_use]
+    pub fn rotate(mut self, rotate: f32) -> Self {
+        self.rotate = rotate;
+        self
+    }
+    /// With this `tabular` (see the field).
+    #[must_use]
+    pub fn tabular(mut self, tabular: bool) -> Self {
+        self.tabular = tabular;
+        self
     }
 }
 /// Each line's marks (`LineMark`), given its index, its text and what the

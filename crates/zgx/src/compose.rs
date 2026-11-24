@@ -9083,7 +9083,7 @@ fn mount_image(
         );
     });
 }
-fn fitted_image_size(
+pub(crate) fn fitted_image_size(
     width: f32,
     height: f32,
     source_width: f32,
