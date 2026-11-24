@@ -3727,8 +3727,9 @@ pub struct Scene {
     hit_walked: std::cell::Cell<u64>,
     cursor_styles: usize,
     /// Scroll content translated since the last flush: its transform before
-    /// the first move, and whether it moved again (see `resolve_moves`).
-    pending_moves: Vec<(NodeId, Transform, bool)>,
+    /// the first move, whether it moved again, and its view's box (its
+    /// parent's, layout's) before the first move (see `resolve_moves`).
+    pending_moves: Vec<(NodeId, Transform, bool, Rect)>,
     /// Device pixels a point (`set_pixel_scale`): scroll content moves by
     /// whole ones. 0 until a host says.
     pixel_scale: f32,
@@ -10268,8 +10269,12 @@ impl Scene {
         // What it needs of the node, read once (a move is the hottest
         // setter: a reorder animation moves every row each frame).
         let node = self.node(id);
-        let (scroll_copy, from, transparent) =
-            (node.scroll_copy, node.transform, node.effects.opacity <= 0.);
+        let (scroll_copy, from, transparent, parent) = (
+            node.scroll_copy,
+            node.transform,
+            node.effects.opacity <= 0.,
+            node.parent,
+        );
         if scroll_copy {
             transform = self.on_pixels(transform);
         }
@@ -10279,8 +10284,11 @@ impl Scene {
         if scroll_copy {
             // Resolved at flush: a copy plus the exposed strip, or full damage.
             match self.pending_moves.iter_mut().find(|(node, ..)| *node == id) {
-                Some((.., again)) => *again = true,
-                None => self.pending_moves.push((id, from, false)),
+                Some((_, _, again, _)) => *again = true,
+                None => {
+                    let view = parent.map_or(Rect::default(), |p| self.tree_node(p).bounds);
+                    self.pending_moves.push((id, from, false, view));
+                }
             }
             self.move_context = None;
             self.node_mut(id).transform = transform;
@@ -16663,7 +16671,7 @@ impl Scene {
         self.moves.clear();
         let pending = std::mem::take(&mut self.pending_moves);
         let mut moves = Vec::new();
-        for (id, from, again) in pending {
+        for (id, from, again, view) in pending {
             if !self.contains(id) {
                 continue;
             }
@@ -16708,6 +16716,14 @@ impl Scene {
                 Some(clip) if self.pixel_scale > 0. => Some(snap_clip(clip, self.pixel_scale)),
                 clip => clip,
             };
+            // Its view laid out again as it moved (shrunk): what the content
+            // painted in the view as it was, outside it now, was damaged (if
+            // at all) where the content is now, not where it painted.
+            if let Some(parent) = self.node(id).parent
+                && self.tree_node(parent).bounds != view
+            {
+                self.damage_view_left(parent, view, clip);
+            }
             let isolated = layered;
             // Clear of what blurs what's behind it: a glass bar over the view takes
             // only the view's band it reaches, and what's beside it still moves.
@@ -16802,6 +16818,27 @@ impl Scene {
             } else {
                 at += 1;
             }
+        }
+    }
+    /// For scroll content that moved this frame as its view `parent` was laid
+    /// out again: the view's box before (`view`, layout's) outside the clip it
+    /// moves within now (`clip`, or the viewport), where its old pixels may
+    /// lie and the move repaints nothing.
+    #[cold]
+    #[inline(never)]
+    fn damage_view_left(&mut self, parent: NodeId, view: Rect, clip: Option<Rect>) {
+        let now = self.tree_node(parent).bounds;
+        let world = self.world_bounds(parent);
+        let was = view.translated(Transform {
+            x: world.x - now.x,
+            y: world.y - now.y,
+        });
+        let clip = clip.unwrap_or(self.viewport);
+        let Some(was) = was.intersection(self.viewport) else {
+            return;
+        };
+        for rest in rect_minus(was, clip) {
+            self.add_damage(rest);
         }
     }
     /// Isolates this subtree into an offscreen group. Opacity then applies once to
