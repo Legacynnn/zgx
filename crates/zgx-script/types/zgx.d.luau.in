@@ -4002,6 +4002,7 @@ declare ui: {
 	-- `ui.web(opts)`: a page for this run. `ui.web(id, opts)`: the host's
 	-- page for `id`, made with `opts` the first time, kept across reloads.
 	web: ((opts: WebOptions?) -> Web) & ((id: string, opts: WebOptions?) -> Web),
+	web_cookie_domains: (profile: string?, reply: (list: { { domain: string, count: number } }?, err: string?) -> ...unknown) -> (),
 	terminal: (props: TerminalProps) -> Node,
 	-- The session for `id`, started the first time; `ui.term(id)` without
 	-- options only looks it up.

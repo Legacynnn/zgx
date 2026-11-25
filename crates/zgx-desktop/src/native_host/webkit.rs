@@ -973,6 +973,122 @@ fn data_store(profile: &WebProfile, mtm: MainThreadMarker) -> Retained<WKWebsite
             .clone()
     })
 }
+pub(crate) fn install_cookie_store() {
+    zgx::web_view::set_cookie_store(Rc::new(MacCookies));
+}
+struct MacCookies;
+impl zgx::web_view::WebCookieStore for MacCookies {
+    fn set_cookies(
+        &self,
+        profile: &WebProfile,
+        cookies: Vec<zgx::web_view::WebCookie>,
+        done: zgx::web_view::CookiesStored,
+    ) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return done(Err("cookies are set from the main thread".into()));
+        };
+        let store = data_store(profile, mtm);
+        let made: Vec<Retained<AnyObject>> = cookies.iter().filter_map(http_cookie).collect();
+        let total = made.len();
+        if total == 0 {
+            zgx::native_view::post(move || done(Ok(0)));
+            return;
+        }
+        let left = Rc::new(Cell::new(total));
+        let done = Rc::new(Cell::new(Some(done)));
+        // SAFETY: the profile's store and its cookie store on the main thread,
+        // where WebKit calls each `void (^)(void)` completion; every cookie
+        // is an NSHTTPCookie made just above.
+        unsafe {
+            let cookie_store: Retained<AnyObject> = msg_send![&*store, httpCookieStore];
+            for cookie in &made {
+                let (left, done) = (left.clone(), done.clone());
+                let stored = block2::RcBlock::new(move || {
+                    left.set(left.get() - 1);
+                    if left.get() == 0
+                        && let Some(done) = done.take()
+                    {
+                        zgx::native_view::post(move || done(Ok(total)));
+                    }
+                });
+                let _: () =
+                    msg_send![&*cookie_store, setCookie: &**cookie, completionHandler: &*stored];
+            }
+        }
+    }
+    fn cookie_domains(&self, profile: &WebProfile, done: zgx::web_view::CookieDomains) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return done(Err("cookies are read from the main thread".into()));
+        };
+        let store = data_store(profile, mtm);
+        let done = Cell::new(Some(done));
+        // SAFETY: as in `set_cookies`; WebKit passes the completion an
+        // NSArray of NSHTTPCookie, each answering `domain` with an NSString.
+        unsafe {
+            let cookie_store: Retained<AnyObject> = msg_send![&*store, httpCookieStore];
+            let fetched =
+                block2::RcBlock::new(move |cookies: std::ptr::NonNull<NSArray<AnyObject>>| {
+                    let cookies = cookies.as_ref();
+                    let domains = (0..cookies.count()).map(|i| {
+                        let cookie = cookies.objectAtIndex(i);
+                        let domain: Retained<NSString> = msg_send![&*cookie, domain];
+                        domain.to_string()
+                    });
+                    let counts = zgx::web_view::count_cookie_domains(domains);
+                    if let Some(done) = done.take() {
+                        zgx::native_view::post(move || done(Ok(counts)));
+                    }
+                });
+            let _: () = msg_send![&*cookie_store, getAllCookies: &*fetched];
+        }
+    }
+}
+fn http_cookie(cookie: &zgx::web_view::WebCookie) -> Option<Retained<AnyObject>> {
+    let path = if cookie.path.is_empty() {
+        "/"
+    } else {
+        cookie.path.as_str()
+    };
+    let mut texts = vec![
+        ("Name", cookie.name.as_str()),
+        ("Value", cookie.value.as_str()),
+        ("Domain", cookie.domain.as_str()),
+        ("Path", path),
+    ];
+    if cookie.secure {
+        texts.push(("Secure", "TRUE"));
+    }
+    if cookie.http_only {
+        texts.push(("HttpOnly", "TRUE"));
+    }
+    match cookie
+        .same_site
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("lax") => texts.push(("SameSite", "lax")),
+        Some("strict") => texts.push(("SameSite", "strict")),
+        _ => {}
+    }
+    let mut keys: Vec<Retained<NSString>> =
+        texts.iter().map(|(k, _)| NSString::from_str(k)).collect();
+    let strings: Vec<Retained<NSString>> =
+        texts.iter().map(|(_, v)| NSString::from_str(v)).collect();
+    let mut values: Vec<&AnyObject> = strings.iter().map(|v| -> &AnyObject { v }).collect();
+    // SAFETY: NSDate's class factory, taking an NSTimeInterval.
+    let expires: Option<Retained<AnyObject>> = cookie
+        .expires
+        .map(|at| unsafe { msg_send![objc2::class!(NSDate), dateWithTimeIntervalSince1970: at] });
+    if let Some(expires) = &expires {
+        keys.push(NSString::from_str("Expires"));
+        values.push(expires);
+    }
+    let keys: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
+    let properties = NSDictionary::<NSString, AnyObject>::from_slices(&keys, &values);
+    // SAFETY: NSHTTPCookie's class factory with a properties dictionary; nil when invalid.
+    unsafe { msg_send![objc2::class!(NSHTTPCookie), cookieWithProperties: &*properties] }
+}
 /// Persistent stores of their own need macOS 14.
 fn named_stores_supported() -> bool {
     // SAFETY: NSObject's `+respondsToSelector:`, returning BOOL.
@@ -1380,7 +1496,9 @@ impl WebViewBackend for MacWebView {
                 if let Some(image) = image.as_ref() {
                     let tiff: *mut NSData = msg_send![image, TIFFRepresentation];
                     let rep: *mut AnyObject = match tiff.as_ref() {
-                        Some(tiff) => msg_send![objc2::class!(NSBitmapImageRep), imageRepWithData: tiff],
+                        Some(tiff) => {
+                            msg_send![objc2::class!(NSBitmapImageRep), imageRepWithData: tiff]
+                        }
                         None => std::ptr::null_mut(),
                     };
                     let jpeg: *mut NSData = match rep.as_ref() {

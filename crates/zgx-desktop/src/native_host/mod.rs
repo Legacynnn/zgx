@@ -28,6 +28,8 @@ mod macos;
 pub(crate) use macos::modifiers_watched;
 #[cfg(target_os = "macos")]
 mod webkit;
+#[cfg(target_os = "macos")]
+pub(crate) use webkit::install_cookie_store;
 #[cfg(all(windows, feature = "webview2"))]
 mod webview2;
 #[cfg(any(all(windows, feature = "webview2"), test))]

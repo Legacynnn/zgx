@@ -211,6 +211,51 @@ fn guarded_web(
 }
 pub(crate) fn install_web(lua: &Lua, ui: &Table, webs: Rc<Webs>) -> mlua::Result<()> {
     ui.set(
+        "web_cookie_domains",
+        lua.create_function(|lua, (profile, reply): (Option<String>, Function)| {
+            use zgx::web_view::WebProfile;
+            let (vm, plugin) = {
+                let env = env(lua)?;
+                env.may(crate::Capability::Web, "ui.web_cookie_domains")?;
+                let plugin = match &*env.grants {
+                    crate::Grants::All => None,
+                    crate::Grants::Only(_) => Some(env.owner.clone()),
+                };
+                (env.vm.clone(), plugin)
+            };
+            let profile = match (profile.as_deref(), plugin) {
+                (None | Some("default"), None) => WebProfile::Default,
+                (Some("ephemeral"), _) => WebProfile::Ephemeral,
+                (Some(name), None) => WebProfile::Named(name.to_owned()),
+                (None | Some("default"), Some(plugin)) => {
+                    WebProfile::Named(format!("plugin:{plugin}"))
+                }
+                (Some(name), Some(plugin)) => WebProfile::Named(format!("plugin:{plugin}/{name}")),
+            };
+            zgx::web_view::cookie_domains(&profile, move |result| {
+                let Some(vm) = vm.upgrade() else {
+                    return;
+                };
+                let outcome = match result {
+                    Ok(domains) => vm
+                        .lua
+                        .create_sequence_from(domains.into_iter().filter_map(|(domain, count)| {
+                            let row = vm.lua.create_table().ok()?;
+                            row.set("domain", domain).ok()?;
+                            row.set("count", count).ok()?;
+                            Some(row)
+                        }))
+                        .and_then(|list| vm.call::<()>(&reply, (list, Value::Nil))),
+                    Err(error) => vm.call::<()>(&reply, (Value::Nil, error)),
+                };
+                if let Err(e) = outcome {
+                    vm.report(e);
+                }
+            });
+            Ok(())
+        })?,
+    )?;
+    ui.set(
         "web",
         lua.create_function(move |lua, (first, opts): (mlua::Value, Option<Table>)| {
             let plugin = {

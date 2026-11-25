@@ -333,6 +333,7 @@ const NOT_ELEMENTS: &[&str] = &[
     "spring_to",
     "loop",
     "web",
+    "web_cookie_domains",
     "term",
     "command",
     "on_mount",

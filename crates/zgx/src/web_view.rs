@@ -41,6 +41,12 @@ use std::{
     rc::{Rc, Weak},
 };
 
+mod cookies;
+pub use cookies::{
+    CookieDomains, CookiesStored, WebCookie, WebCookieStore, cookie_domains, count_cookie_domains,
+    set_cookie_store, set_cookies,
+};
+
 /// Where a page keeps cookies, storage and caches.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WebProfile {
