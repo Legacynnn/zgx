@@ -337,6 +337,8 @@ impl UserData for WebUd {
         fields.add_field_method_get("can_go_forward", |_, w| Ok(w.0.can_go_forward()));
         fields.add_field_method_get("focused", |_, w| Ok(w.0.focused()));
         fields.add_field_method_get("error", |_, w| Ok(w.0.state().get().error));
+        // Closed (`web:close()`): it shows no page again.
+        fields.add_field_method_get("closed", |_, w| Ok(w.0.is_closed()));
         fields.add_field_method_get("full_screen", |_, w| {
             Ok(w.0.state().with(|state| state.full_screen))
         });
@@ -382,6 +384,41 @@ impl UserData for WebUd {
                 webs.0.borrow_mut().remove(&key.id);
             }
             w.0.close();
+            Ok(())
+        });
+        // `web:on_popup(function(popup, url) … end)`: windows its pages open
+        // (`window.open`, `target=_blank`) arrive as pages of their own,
+        // linked to this one (`window.opener`), to show (a tab) or close.
+        methods.add_method("on_popup", |lua, w, handler: Function| {
+            let vm = env(lua)?.vm.clone();
+            w.0.set_popup_handler(move |popup, request| {
+                let Some(vm) = vm.upgrade() else {
+                    return popup.close();
+                };
+                vm.runtime.clone().batch(|| {
+                    let called = vm
+                        .lua
+                        .create_userdata(WebUd(popup, None))
+                        .and_then(|popup| vm.call::<()>(&handler, (popup, request.url)));
+                    if let Err(e) = called {
+                        vm.report(e);
+                    }
+                });
+            });
+            Ok(())
+        });
+        // `web:on_close(function() … end)`: the page asked to close
+        // (`window.close()` in a popup); `web:close()` ends it.
+        methods.add_method("on_close", |lua, w, handler: Function| {
+            let vm = env(lua)?.vm.clone();
+            w.0.set_close_handler(move || {
+                let Some(vm) = vm.upgrade() else { return };
+                vm.runtime.clone().batch(|| {
+                    if let Err(e) = vm.call::<()>(&handler, ()) {
+                        vm.report(e);
+                    }
+                });
+            });
             Ok(())
         });
         methods.add_method("forward", |_, w, ()| {
