@@ -1370,10 +1370,11 @@ impl WebViewBackend for MacWebView {
         }
     }
     fn snapshot(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
+        const SNAPSHOT_WIDTH: f64 = 800.0;
         let done = Rc::new(Cell::new(Some(done)));
         // SAFETY: WebKit calls the completion on the main thread with an
-        // NSImage or an NSError; the PNG is made there from the image's
-        // TIFF data through NSBitmapImageRep, all retained for the call.
+        // NSImage or an NSError; the JPEG is made there from the image's
+        // TIFF data through NSBitmapImageRep, as a JPEG, all retained for the call.
         let completion = block2::RcBlock::new(move |image: *mut AnyObject, error: *mut NSError| {
             let result = unsafe {
                 if let Some(image) = image.as_ref() {
@@ -1382,16 +1383,22 @@ impl WebViewBackend for MacWebView {
                         Some(tiff) => msg_send![objc2::class!(NSBitmapImageRep), imageRepWithData: tiff],
                         None => std::ptr::null_mut(),
                     };
-                    let png: *mut NSData = match rep.as_ref() {
+                    let jpeg: *mut NSData = match rep.as_ref() {
                         Some(rep) => {
-                            let none = NSDictionary::<NSString, AnyObject>::new();
-                            msg_send![rep, representationUsingType: 4usize, properties: &*none]
+                            let quality = NSNumber::new_f64(0.75);
+                            let key = NSString::from_str("NSImageCompressionFactor");
+                            let properties: *mut AnyObject = msg_send![
+                                objc2::class!(NSDictionary),
+                                dictionaryWithObject: &*quality,
+                                forKey: &*key
+                            ];
+                            msg_send![rep, representationUsingType: 3usize, properties: properties]
                         }
                         None => std::ptr::null_mut(),
                     };
-                    match png.as_ref() {
-                        Some(png) => Ok(png.to_vec()),
-                        None => Err("the page's picture couldn't be made a PNG".to_string()),
+                    match jpeg.as_ref() {
+                        Some(jpeg) => Ok(jpeg.to_vec()),
+                        None => Err("the page's picture couldn't be made a JPEG".to_string()),
                     }
                 } else if let Some(error) = error.as_ref() {
                     Err(error.localizedDescription().to_string())
@@ -1404,11 +1411,19 @@ impl WebViewBackend for MacWebView {
             }
         });
         unsafe {
+            let config: *mut AnyObject = msg_send![objc2::class!(WKSnapshotConfiguration), new];
+            if let Some(config) = config.as_ref() {
+                let width = NSNumber::new_f64(SNAPSHOT_WIDTH);
+                let _: () = msg_send![config, setSnapshotWidth: &*width];
+            }
             let _: () = msg_send![
                 &*self.view,
-                takeSnapshotWithConfiguration: std::ptr::null::<AnyObject>(),
+                takeSnapshotWithConfiguration: config,
                 completionHandler: &*completion
             ];
+            if !config.is_null() {
+                let _: () = msg_send![config, release];
+            }
         }
     }
     fn clear_site_data(&self, url: &str, done: Box<dyn FnOnce(Result<usize, String>)>) {

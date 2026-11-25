@@ -572,7 +572,7 @@ pub trait WebViewBackend {
             "this platform's web view can't clear a site's data".into()
         ));
     }
-    /// A PNG of the page's visible area (see [`WebView::snapshot`]), calling
+    /// A JPEG of the page's visible area, about 800 points wide (see [`WebView::snapshot`]), calling
     /// `done` once, on the UI thread. One that can't says so.
     fn snapshot(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
         done(Err("this platform's web view can't take a picture".into()));
@@ -990,8 +990,8 @@ impl WebView {
             (Some(backend), Some(_)) => backend.clear_site_data(url, Box::new(done)),
         }
     }
-    /// A PNG of the page as it shows: its visible area, at the screen's
-    /// scale. Fails while the view isn't showing.
+    /// A JPEG of the page as it shows: its visible area, about 800 points
+    /// wide at the screen's scale. Fails while the view isn't showing.
     pub fn snapshot(&self, done: impl FnOnce(Result<Vec<u8>, String>) + 'static) {
         match self.backend() {
             None => done(Err("the web view isn't showing yet".into())),

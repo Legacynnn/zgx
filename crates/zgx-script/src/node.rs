@@ -388,7 +388,7 @@ impl UserData for WebUd {
             });
             Ok(())
         });
-        // `web:snapshot(function(png_base64, err) … end)`: the page as it shows.
+        // `web:snapshot(function(jpeg_base64, err) … end)`: the page as it shows.
         methods.add_method("snapshot", |lua, w, reply: Function| {
             let vm = env(lua)?.vm.clone();
             w.0.snapshot(move |result| {
@@ -396,9 +396,9 @@ impl UserData for WebUd {
                     return;
                 };
                 let outcome = match result {
-                    Ok(png) => {
+                    Ok(jpeg) => {
                         use base64::Engine as _;
-                        let text = base64::engine::general_purpose::STANDARD.encode(png);
+                        let text = base64::engine::general_purpose::STANDARD.encode(jpeg);
                         vm.call::<()>(&reply, (text, mlua::Value::Nil))
                     }
                     Err(error) => vm.call::<()>(&reply, (Value::Nil, error)),
