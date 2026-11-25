@@ -572,6 +572,11 @@ pub trait WebViewBackend {
             "this platform's web view can't clear a site's data".into()
         ));
     }
+    /// A PNG of the page's visible area (see [`WebView::snapshot`]), calling
+    /// `done` once, on the UI thread. One that can't says so.
+    fn snapshot(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
+        done(Err("this platform's web view can't take a picture".into()));
+    }
 }
 
 /// The host a site's data is kept under for `url`: lowercase, without
@@ -983,6 +988,14 @@ impl WebView {
             (_, None) => done(Err(format!("{url} has no site"))),
             (None, _) => done(Err("the web view isn't showing yet".into())),
             (Some(backend), Some(_)) => backend.clear_site_data(url, Box::new(done)),
+        }
+    }
+    /// A PNG of the page as it shows: its visible area, at the screen's
+    /// scale. Fails while the view isn't showing.
+    pub fn snapshot(&self, done: impl FnOnce(Result<Vec<u8>, String>) + 'static) {
+        match self.backend() {
+            None => done(Err("the web view isn't showing yet".into())),
+            Some(backend) => backend.snapshot(Box::new(done)),
         }
     }
     /// Stop finding: the match goes unselected and the platform's

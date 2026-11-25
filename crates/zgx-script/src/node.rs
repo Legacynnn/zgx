@@ -388,6 +388,27 @@ impl UserData for WebUd {
             });
             Ok(())
         });
+        // `web:snapshot(function(png_base64, err) … end)`: the page as it shows.
+        methods.add_method("snapshot", |lua, w, reply: Function| {
+            let vm = env(lua)?.vm.clone();
+            w.0.snapshot(move |result| {
+                let Some(vm) = vm.upgrade() else {
+                    return;
+                };
+                let outcome = match result {
+                    Ok(png) => {
+                        use base64::Engine as _;
+                        let text = base64::engine::general_purpose::STANDARD.encode(png);
+                        vm.call::<()>(&reply, (text, mlua::Value::Nil))
+                    }
+                    Err(error) => vm.call::<()>(&reply, (Value::Nil, error)),
+                };
+                if let Err(e) = outcome {
+                    vm.report(e);
+                }
+            });
+            Ok(())
+        });
         // `web:clear_site_data(url)`: a promise of how many of the
         // platform's records for the url's site went (`WebView::clear_site_data`).
         methods.add_method("clear_site_data", |lua, w, url: String| {

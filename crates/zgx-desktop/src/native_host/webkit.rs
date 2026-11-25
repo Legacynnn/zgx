@@ -1369,6 +1369,48 @@ impl WebViewBackend for MacWebView {
             );
         }
     }
+    fn snapshot(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
+        let done = Rc::new(Cell::new(Some(done)));
+        // SAFETY: WebKit calls the completion on the main thread with an
+        // NSImage or an NSError; the PNG is made there from the image's
+        // TIFF data through NSBitmapImageRep, all retained for the call.
+        let completion = block2::RcBlock::new(move |image: *mut AnyObject, error: *mut NSError| {
+            let result = unsafe {
+                if let Some(image) = image.as_ref() {
+                    let tiff: *mut NSData = msg_send![image, TIFFRepresentation];
+                    let rep: *mut AnyObject = match tiff.as_ref() {
+                        Some(tiff) => msg_send![objc2::class!(NSBitmapImageRep), imageRepWithData: tiff],
+                        None => std::ptr::null_mut(),
+                    };
+                    let png: *mut NSData = match rep.as_ref() {
+                        Some(rep) => {
+                            let none = NSDictionary::<NSString, AnyObject>::new();
+                            msg_send![rep, representationUsingType: 4usize, properties: &*none]
+                        }
+                        None => std::ptr::null_mut(),
+                    };
+                    match png.as_ref() {
+                        Some(png) => Ok(png.to_vec()),
+                        None => Err("the page's picture couldn't be made a PNG".to_string()),
+                    }
+                } else if let Some(error) = error.as_ref() {
+                    Err(error.localizedDescription().to_string())
+                } else {
+                    Err("WebKit gave no picture".to_string())
+                }
+            };
+            if let Some(done) = done.take() {
+                zgx::native_view::post(move || done(result));
+            }
+        });
+        unsafe {
+            let _: () = msg_send![
+                &*self.view,
+                takeSnapshotWithConfiguration: std::ptr::null::<AnyObject>(),
+                completionHandler: &*completion
+            ];
+        }
+    }
     fn clear_site_data(&self, url: &str, done: Box<dyn FnOnce(Result<usize, String>)>) {
         let Some(host) = zgx::web_view::site_host(url) else {
             return done(Err(format!("{url} has no site")));
