@@ -41,6 +41,12 @@ use std::{
     rc::{Rc, Weak},
 };
 
+mod cookies;
+pub use cookies::{
+    CookieDomains, CookiesStored, WebCookie, WebCookieStore, cookie_domains, count_cookie_domains,
+    set_cookie_store, set_cookies,
+};
+
 /// Where a page keeps cookies, storage and caches.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WebProfile {
@@ -318,8 +324,11 @@ pub struct WebViewOptions {
     /// Pages may post to the app: `window.webkit.messageHandlers.zgx
     /// .postMessage(value)` arrives as [`WebViewEvent::Message`] (JSON).
     pub messages: bool,
-    /// Pages may open windows (`window.open`, target=_blank): each request
-    /// arrives as [`WebViewEvent::NewWindowRequested`] and opens nothing.
+    /// Pages may open windows (`window.open`, target=_blank). With a popup
+    /// handler ([`WebView::set_popup_handler`]) each opens as a page of its
+    /// own that keeps its link to the page that opened it (macOS); otherwise
+    /// each request arrives as [`WebViewEvent::NewWindowRequested`] and
+    /// opens nothing.
     pub new_windows: bool,
     /// Scripts injected at document start, in order, before the page's own.
     pub scripts: Vec<UserScript>,
@@ -451,6 +460,25 @@ pub enum WebViewEvent {
     },
     /// The page's process ended (crashed or was killed); reload to recover.
     ProcessTerminated,
+    /// The page asked to close (`window.close()` in a window a script
+    /// opened, as a popup is): nothing closed, the app decides (see
+    /// [`WebView::set_close_handler`]).
+    CloseRequested,
+}
+
+/// A page's request to open a window that keeps its link to it
+/// (`window.open`, a `target=_blank` link): see [`WebView::set_popup_handler`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PopupRequest {
+    /// What it opens; the popup loads it itself.
+    pub url: String,
+}
+impl PopupRequest {
+    /// A request to open `url` (for hosts).
+    pub fn new(url: impl Into<String>) -> Self {
+        Self { url: url.into() }
+    }
 }
 
 /// A JavaScript evaluation's result: the value as JSON, or the error.
@@ -572,6 +600,11 @@ pub trait WebViewBackend {
             "this platform's web view can't clear a site's data".into()
         ));
     }
+    /// A JPEG of the page's visible area, about 800 points wide (see [`WebView::snapshot`]), calling
+    /// `done` once, on the UI thread. One that can't says so.
+    fn snapshot(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
+        done(Err("this platform's web view can't take a picture".into()));
+    }
 }
 
 /// The host a site's data is kept under for `url`: lowercase, without
@@ -606,9 +639,15 @@ pub fn site_matches(host: &str, record: &str) -> bool {
 type Listener = Rc<RefCell<dyn FnMut(&WebViewEvent)>>;
 type Policy = Rc<dyn Fn(&NavigationRequest) -> bool>;
 type DownloadHandler = Rc<dyn Fn(DownloadRequest, DownloadResponder)>;
+type PopupHandler = Rc<dyn Fn(WebView, PopupRequest)>;
 struct Inner {
     id: u64,
     options: WebViewOptions,
+    runtime: Runtime,
+    /// The page that opened this one as a popup.
+    opener: Option<WeakWebView>,
+    popups: RefCell<Option<PopupHandler>>,
+    on_close: RefCell<Option<Rc<dyn Fn()>>>,
     state: Signal<WebViewState>,
     /// The pointer over the page, in points from its top left.
     pointer: Signal<Option<(f32, f32)>>,
@@ -693,6 +732,9 @@ impl WebView {
     /// A controller for a page made with `options`. Commands queue until a
     /// platform page attaches (`attach`).
     pub fn new(runtime: &Runtime, options: WebViewOptions) -> Self {
+        Self::made(runtime, options, None)
+    }
+    fn made(runtime: &Runtime, options: WebViewOptions, opener: Option<WeakWebView>) -> Self {
         let id = NEXT_ID.with(|next| {
             let id = next.get() + 1;
             next.set(id);
@@ -701,6 +743,10 @@ impl WebView {
         Self(Rc::new(Inner {
             id,
             options,
+            runtime: runtime.clone(),
+            opener,
+            popups: RefCell::new(None),
+            on_close: RefCell::new(None),
             state: runtime.signal(WebViewState::default()),
             pointer: runtime.signal(None),
             attached: runtime.signal(false),
@@ -851,6 +897,8 @@ impl WebView {
             return;
         }
         self.0.queued.borrow_mut().clear();
+        self.0.popups.borrow_mut().take();
+        self.0.on_close.borrow_mut().take();
         drop(self.detach());
     }
     /// Whether it was closed (`close`).
@@ -985,6 +1033,14 @@ impl WebView {
             (Some(backend), Some(_)) => backend.clear_site_data(url, Box::new(done)),
         }
     }
+    /// A JPEG of the page as it shows: its visible area, about 800 points
+    /// wide at the screen's scale. Fails while the view isn't showing.
+    pub fn snapshot(&self, done: impl FnOnce(Result<Vec<u8>, String>) + 'static) {
+        match self.backend() {
+            None => done(Err("the web view isn't showing yet".into())),
+            Some(backend) => backend.snapshot(Box::new(done)),
+        }
+    }
     /// Stop finding: the match goes unselected and the platform's
     /// highlights of the others go.
     pub fn clear_find(&self) {
@@ -1031,6 +1087,68 @@ impl WebView {
     pub fn allows(&self, request: &NavigationRequest) -> bool {
         let policy = self.0.policy.borrow().clone();
         policy.is_none_or(|policy| policy(request))
+    }
+    /// Open the windows its pages ask for (`window.open`, `target=_blank`
+    /// links, when [`WebViewOptions::new_windows`]) as popups: pages of
+    /// their own, made by zgx with this one's options, navigation policy,
+    /// download and popup handlers, that keep their link to it
+    /// (`window.opener`, `postMessage` between them, a sign-in window
+    /// handing its result back). `handler` gets each popup and what it
+    /// opens, on the UI thread at a safe point; the popup is loading
+    /// already, and shows wherever the app mounts it ([`web_view`]). Dropping
+    /// it unkept closes it. macOS only: elsewhere requests still arrive as
+    /// [`WebViewEvent::NewWindowRequested`].
+    pub fn set_popup_handler(&self, handler: impl Fn(WebView, PopupRequest) + 'static) {
+        *self.0.popups.borrow_mut() = Some(Rc::new(handler));
+    }
+    /// Whether a popup handler is set (the platform's question).
+    pub fn wants_popups(&self) -> bool {
+        !self.0.closed.get() && self.0.popups.borrow().is_some()
+    }
+    /// The controller for a popup this page opens (for hosts, from inside
+    /// the platform's callback, before attaching the popup's page to it):
+    /// this one's options, policy and handlers, `url` shown as its URL.
+    pub fn open_popup(&self, url: &str) -> WebView {
+        let popup = Self::made(
+            &self.0.runtime,
+            self.0.options.clone(),
+            Some(self.downgrade()),
+        );
+        *popup.0.policy.borrow_mut() = self.0.policy.borrow().clone();
+        *popup.0.downloads.borrow_mut() = self.0.downloads.borrow().clone();
+        *popup.0.popups.borrow_mut() = self.0.popups.borrow().clone();
+        popup.0.state.update(|state| state.url = url.to_owned());
+        popup
+    }
+    /// Hand `popup` to the popup handler (for hosts; call from a delivery).
+    /// Without one it is dropped, and closes.
+    pub fn popup_opened(&self, popup: WebView, request: PopupRequest) {
+        let handler = self.0.popups.borrow().clone();
+        match handler {
+            Some(handler) if !self.0.closed.get() => handler(popup, request),
+            _ => popup.close(),
+        }
+    }
+    /// The page that opened this one as a popup, while it exists.
+    pub fn opener(&self) -> Option<WebView> {
+        self.0.opener.as_ref().and_then(WeakWebView::upgrade)
+    }
+    /// Called when the page asks to close (`window.close()` in a popup):
+    /// close it ([`WebView::close`]) and take it out of view, or not.
+    pub fn set_close_handler(&self, handler: impl Fn() + 'static) {
+        *self.0.on_close.borrow_mut() = Some(Rc::new(handler));
+    }
+    /// The page asked to close (for hosts; call from a delivery): tell
+    /// subscribers ([`WebViewEvent::CloseRequested`]) and the close handler.
+    pub fn close_requested(&self) {
+        if self.0.closed.get() {
+            return;
+        }
+        self.emit(WebViewEvent::CloseRequested);
+        let handler = self.0.on_close.borrow().clone();
+        if let Some(handler) = handler {
+            handler();
+        }
     }
     /// Call `listener` with each platform event, until the subscription drops.
     pub fn on_event(&self, listener: impl FnMut(&WebViewEvent) + 'static) -> WebViewSubscription {
@@ -1319,5 +1437,58 @@ mod tests {
         web.set_navigation_policy(|r| !r.url.starts_with("file:"));
         assert!(web.allows(&request("https://a.test/")));
         assert!(!web.allows(&request("file:///etc/passwd")));
+    }
+
+    #[test]
+    fn a_popup_is_made_like_its_opener_and_keeps_its_link() {
+        let runtime = crate::reactive::Runtime::new();
+        let options = WebViewOptions {
+            profile: WebProfile::Named("work".into()),
+            ..WebViewOptions::default()
+        };
+        let web = WebView::new(&runtime, options.clone());
+        assert!(!web.wants_popups());
+        web.set_navigation_policy(|r| !r.url.starts_with("file:"));
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let seen = opened.clone();
+        web.set_popup_handler(move |popup, request| seen.borrow_mut().push((popup, request.url)));
+        assert!(web.wants_popups());
+        let popup = web.open_popup("https://auth.test/sign-in");
+        assert_eq!(popup.options(), &options);
+        assert_eq!(popup.url(), "https://auth.test/sign-in");
+        assert_eq!(popup.opener(), Some(web.clone()));
+        assert!(
+            popup.wants_popups(),
+            "its own popups go to the same handler"
+        );
+        assert!(!popup.allows(&NavigationRequest {
+            url: "file:///etc/passwd".into(),
+            main_frame: true,
+            kind: NavigationKind::Link,
+            source_url: String::new(),
+        }));
+        web.popup_opened(
+            popup.clone(),
+            PopupRequest {
+                url: "https://auth.test/sign-in".into(),
+            },
+        );
+        assert_eq!(opened.borrow().len(), 1);
+        assert_eq!(opened.borrow()[0].0, popup);
+
+        let asked = Rc::new(Cell::new(0));
+        let count = asked.clone();
+        popup.set_close_handler(move || count.set(count.get() + 1));
+        popup.close_requested();
+        assert_eq!(asked.get(), 1);
+        popup.close();
+        popup.close_requested();
+        assert_eq!(asked.get(), 1, "a closed page asks nothing");
+
+        web.close();
+        assert!(!web.wants_popups());
+        let late = WebView::new(&runtime, WebViewOptions::default());
+        web.popup_opened(late.clone(), PopupRequest::default());
+        assert!(late.is_closed(), "a closed opener's popup closes");
     }
 }

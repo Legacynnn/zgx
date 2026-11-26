@@ -34,7 +34,7 @@ use std::{
     rc::Rc,
 };
 use zgx::web_view::{
-    NavigationKind, NavigationRequest, SchemeHandler, SchemeRequest, SchemeResponder,
+    NavigationKind, NavigationRequest, PopupRequest, SchemeHandler, SchemeRequest, SchemeResponder,
     SchemeResponse, ScriptResult, WeakWebView, WebProfile, WebView, WebViewBackend, WebViewCommand,
     WebViewEvent,
 };
@@ -406,16 +406,13 @@ define_class!(
     }
     unsafe impl WKUIDelegate for Observer {
         #[unsafe(method_id(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
-        fn create_window(&self, _view: &WKWebView, _configuration: &WKWebViewConfiguration, action: &WKNavigationAction, _features: &WKWindowFeatures) -> Option<Retained<WKWebView>> {
-            if self.ivars().new_windows {
-                // SAFETY: getters of the action WebKit passes for this call.
-                let url = unsafe { action.request().URL() }
-                    .and_then(|url| url.absoluteString())
-                    .map(|url| url.to_string())
-                    .unwrap_or_default();
-                self.post(move |web| web.emit(WebViewEvent::NewWindowRequested { url }));
-            }
-            None
+        fn create_window(&self, _view: &WKWebView, configuration: &WKWebViewConfiguration, action: &WKNavigationAction, _features: &WKWindowFeatures) -> Option<Retained<WKWebView>> {
+            self.open_window(configuration, action)
+        }
+        /// `window.close()` in a window a script opened: the app decides.
+        #[unsafe(method(webViewDidClose:))]
+        fn did_close(&self, _view: &WKWebView) {
+            self.post(|web| web.close_requested());
         }
         /// `alert(message)`: an alert sheet with OK.
         #[unsafe(method(webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:))]
@@ -529,45 +526,99 @@ define_class!(
     unsafe impl WKScriptMessageHandler for Observer {
         #[unsafe(method(userContentController:didReceiveScriptMessage:))]
         fn message(&self, _controller: &WKUserContentController, message: &WKScriptMessage) {
-            // SAFETY: the message's name, on the main thread.
-            if unsafe { message.name() }.to_string() == PRINT {
-                if let Some(view) = self.ivars().view.borrow().load() {
-                    print_page(&view);
+            // A popup shares its opener's content controller, so its
+            // messages come here: each goes to the page that sent it.
+            // SAFETY: the message's web view, a weak getter, nil-checked.
+            let sender = unsafe { message.webView() };
+            let own = self.ivars().view.borrow().load();
+            match (sender, own) {
+                (Some(sender), Some(own)) if !std::ptr::eq(&*sender, &*own) => {
+                    if let Some(page) = popup_observer(&sender) {
+                        page.deliver(message);
+                    }
                 }
-                return;
+                _ => self.deliver(message),
             }
-            // SAFETY: getters of the message WebKit passes for this call
-            // (main thread); the body is any of the JavaScript-bridged
-            // Foundation objects, which `json` reads as `AnyObject`.
-            let body = unsafe { message.body() };
-            let body = match body.downcast_ref::<NSString>() {
-                Some(text) => text.to_string(),
-                None => json(Some(&body)),
-            };
-            // Who sent it: any page, any frame, can.
-            // SAFETY: as above: getters on the message, each result retained.
-            let (origin, main_frame) = unsafe {
-                let frame = message.frameInfo();
-                let origin = frame.securityOrigin();
-                let (scheme, host, port) =
-                    (origin.protocol().to_string(), origin.host().to_string(), origin.port());
-                let origin = if port == 0 {
-                    format!("{scheme}://{host}")
-                } else {
-                    format!("{scheme}://{host}:{port}")
-                };
-                (origin, frame.isMainFrame())
-            };
-            self.post(move |web| {
-                web.emit(WebViewEvent::Message {
-                    body,
-                    origin,
-                    main_frame,
-                })
-            });
         }
     }
 );
+
+impl Observer {
+    /// A page's `window.open`: a popup made with `configuration` when the
+    /// app takes popups, else a request the app hears of.
+    fn open_window(
+        &self,
+        configuration: &WKWebViewConfiguration,
+        action: &WKNavigationAction,
+    ) -> Option<Retained<WKWebView>> {
+        if !self.ivars().new_windows {
+            return None;
+        }
+        // SAFETY: getters of the action WebKit passes for this call.
+        let url = unsafe { action.request().URL() }
+            .and_then(|url| url.absoluteString())
+            .map(|url| url.to_string())
+            .unwrap_or_default();
+        let web = self.ivars().web.upgrade();
+        let Some(web) = web.filter(WebView::wants_popups) else {
+            self.post(move |web| web.emit(WebViewEvent::NewWindowRequested { url }));
+            return None;
+        };
+        // WebKit links the page it returns to its opener only when made
+        // with `configuration`, and loads the request into it itself.
+        let popup = web.open_popup(&url);
+        let page = MacWebView::popup(&popup, configuration, self.mtm());
+        let view = page.view.clone();
+        popup.attach(Rc::new(page));
+        let opener = web.downgrade();
+        zgx::native_view::post(move || match opener.upgrade() {
+            Some(opener) => opener.popup_opened(popup, PopupRequest::new(url)),
+            None => popup.close(),
+        });
+        Some(view)
+    }
+    fn deliver(&self, message: &WKScriptMessage) {
+        // SAFETY: the message's name, on the main thread.
+        if unsafe { message.name() }.to_string() == PRINT {
+            if let Some(view) = self.ivars().view.borrow().load() {
+                print_page(&view);
+            }
+            return;
+        }
+        // SAFETY: getters of the message WebKit passes for this call
+        // (main thread); the body is any of the JavaScript-bridged
+        // Foundation objects, which `json` reads as `AnyObject`.
+        let body = unsafe { message.body() };
+        let body = match body.downcast_ref::<NSString>() {
+            Some(text) => text.to_string(),
+            None => json(Some(&body)),
+        };
+        // Who sent it: any page, any frame, can.
+        // SAFETY: as above: getters on the message, each result retained.
+        let (origin, main_frame) = unsafe {
+            let frame = message.frameInfo();
+            let origin = frame.securityOrigin();
+            let (scheme, host, port) = (
+                origin.protocol().to_string(),
+                origin.host().to_string(),
+                origin.port(),
+            );
+            let origin = if port == 0 {
+                format!("{scheme}://{host}")
+            } else {
+                format!("{scheme}://{host}:{port}")
+            };
+            (origin, frame.isMainFrame())
+        };
+        self.post(move |web| {
+            web.emit(WebViewEvent::Message {
+                body,
+                origin,
+                main_frame,
+            })
+        });
+    }
+}
 
 pub(crate) struct SchemeState {
     web_view: u64,
@@ -650,6 +701,8 @@ define_class!(
 );
 
 thread_local! {
+    /// Popups' pages and their observers, which their messages go to.
+    static POPUP_PAGES: RefCell<Vec<(Weak<WKWebView>, Weak<Observer>)>> = const { RefCell::new(Vec::new()) };
     /// Requests being served, by id, until answered or stopped (main thread).
     static SCHEME_TASKS: RefCell<HashMap<u64, Retained<ProtocolObject<dyn WKURLSchemeTask>>>> = RefCell::new(HashMap::new());
     static NEXT_SCHEME_TASK: Cell<u64> = const { Cell::new(0) };
@@ -855,6 +908,18 @@ fn load_cancelled(domain: &str, code: isize) -> bool {
     }
 }
 
+/// The observer of the popup showing in `view`.
+fn popup_observer(view: &WKWebView) -> Option<Retained<Observer>> {
+    POPUP_PAGES.with(|pages| {
+        pages.borrow().iter().find_map(|(page, observer)| {
+            page.load()
+                .is_some_and(|page| std::ptr::eq(&*page, view))
+                .then(|| observer.load())
+                .flatten()
+        })
+    })
+}
+
 fn url_of(view: &WKWebView) -> String {
     // SAFETY: a plain getter on the main thread, nil-checked.
     unsafe { view.URL() }
@@ -973,6 +1038,122 @@ fn data_store(profile: &WebProfile, mtm: MainThreadMarker) -> Retained<WKWebsite
             .clone()
     })
 }
+pub(crate) fn install_cookie_store() {
+    zgx::web_view::set_cookie_store(Rc::new(MacCookies));
+}
+struct MacCookies;
+impl zgx::web_view::WebCookieStore for MacCookies {
+    fn set_cookies(
+        &self,
+        profile: &WebProfile,
+        cookies: Vec<zgx::web_view::WebCookie>,
+        done: zgx::web_view::CookiesStored,
+    ) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return done(Err("cookies are set from the main thread".into()));
+        };
+        let store = data_store(profile, mtm);
+        let made: Vec<Retained<AnyObject>> = cookies.iter().filter_map(http_cookie).collect();
+        let total = made.len();
+        if total == 0 {
+            zgx::native_view::post(move || done(Ok(0)));
+            return;
+        }
+        let left = Rc::new(Cell::new(total));
+        let done = Rc::new(Cell::new(Some(done)));
+        // SAFETY: the profile's store and its cookie store on the main thread,
+        // where WebKit calls each `void (^)(void)` completion; every cookie
+        // is an NSHTTPCookie made just above.
+        unsafe {
+            let cookie_store: Retained<AnyObject> = msg_send![&*store, httpCookieStore];
+            for cookie in &made {
+                let (left, done) = (left.clone(), done.clone());
+                let stored = block2::RcBlock::new(move || {
+                    left.set(left.get() - 1);
+                    if left.get() == 0
+                        && let Some(done) = done.take()
+                    {
+                        zgx::native_view::post(move || done(Ok(total)));
+                    }
+                });
+                let _: () =
+                    msg_send![&*cookie_store, setCookie: &**cookie, completionHandler: &*stored];
+            }
+        }
+    }
+    fn cookie_domains(&self, profile: &WebProfile, done: zgx::web_view::CookieDomains) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return done(Err("cookies are read from the main thread".into()));
+        };
+        let store = data_store(profile, mtm);
+        let done = Cell::new(Some(done));
+        // SAFETY: as in `set_cookies`; WebKit passes the completion an
+        // NSArray of NSHTTPCookie, each answering `domain` with an NSString.
+        unsafe {
+            let cookie_store: Retained<AnyObject> = msg_send![&*store, httpCookieStore];
+            let fetched =
+                block2::RcBlock::new(move |cookies: std::ptr::NonNull<NSArray<AnyObject>>| {
+                    let cookies = cookies.as_ref();
+                    let domains = (0..cookies.count()).map(|i| {
+                        let cookie = cookies.objectAtIndex(i);
+                        let domain: Retained<NSString> = msg_send![&*cookie, domain];
+                        domain.to_string()
+                    });
+                    let counts = zgx::web_view::count_cookie_domains(domains);
+                    if let Some(done) = done.take() {
+                        zgx::native_view::post(move || done(Ok(counts)));
+                    }
+                });
+            let _: () = msg_send![&*cookie_store, getAllCookies: &*fetched];
+        }
+    }
+}
+fn http_cookie(cookie: &zgx::web_view::WebCookie) -> Option<Retained<AnyObject>> {
+    let path = if cookie.path.is_empty() {
+        "/"
+    } else {
+        cookie.path.as_str()
+    };
+    let mut texts = vec![
+        ("Name", cookie.name.as_str()),
+        ("Value", cookie.value.as_str()),
+        ("Domain", cookie.domain.as_str()),
+        ("Path", path),
+    ];
+    if cookie.secure {
+        texts.push(("Secure", "TRUE"));
+    }
+    if cookie.http_only {
+        texts.push(("HttpOnly", "TRUE"));
+    }
+    match cookie
+        .same_site
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("lax") => texts.push(("SameSite", "lax")),
+        Some("strict") => texts.push(("SameSite", "strict")),
+        _ => {}
+    }
+    let mut keys: Vec<Retained<NSString>> =
+        texts.iter().map(|(k, _)| NSString::from_str(k)).collect();
+    let strings: Vec<Retained<NSString>> =
+        texts.iter().map(|(_, v)| NSString::from_str(v)).collect();
+    let mut values: Vec<&AnyObject> = strings.iter().map(|v| -> &AnyObject { v }).collect();
+    // SAFETY: NSDate's class factory, taking an NSTimeInterval.
+    let expires: Option<Retained<AnyObject>> = cookie
+        .expires
+        .map(|at| unsafe { msg_send![objc2::class!(NSDate), dateWithTimeIntervalSince1970: at] });
+    if let Some(expires) = &expires {
+        keys.push(NSString::from_str("Expires"));
+        values.push(expires);
+    }
+    let keys: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
+    let properties = NSDictionary::<NSString, AnyObject>::from_slices(&keys, &values);
+    // SAFETY: NSHTTPCookie's class factory with a properties dictionary; nil when invalid.
+    unsafe { msg_send![objc2::class!(NSHTTPCookie), cookieWithProperties: &*properties] }
+}
 /// Persistent stores of their own need macOS 14.
 fn named_stores_supported() -> bool {
     // SAFETY: NSObject's `+respondsToSelector:`, returning BOOL.
@@ -1003,6 +1184,9 @@ pub(crate) struct MacWebView {
     /// The page's custom-scheme servers, kept for as long as it is.
     _schemes: Vec<Retained<SchemeServer>>,
     messages: bool,
+    /// A popup's content controller is its opener's: the opener's
+    /// handlers stay on it.
+    popup: bool,
     transparent: bool,
     /// The last HTML shown and its base: WebKit reloads such a page by
     /// fetching its URL (`about:blank`, a blank page), so reload shows it again.
@@ -1045,7 +1229,7 @@ impl MacWebView {
         // scheme is one WebKit does not serve, given once (WebKit raises
         // otherwise); the configuration retains its scheme handlers and the
         // content controller its message handler (removed in `Drop`).
-        let view = unsafe {
+        let configuration = unsafe {
             let configuration = WKWebViewConfiguration::new(mtm);
             // A page's `requestFullscreen`: WebKit's own full-screen window
             // (macOS 12.3; off before, as WKWebView's default).
@@ -1100,12 +1284,41 @@ impl MacWebView {
                 );
                 content.addUserScript(&script);
             }
-            // SAFETY: WKWebView's designated initializer, on a fresh
-            // allocation of zgx's subclass, which adds no state.
+            configuration
+        };
+        Self::made(web, observer, &configuration, schemes, false, mtm)
+    }
+    /// The page of `web`, a popup WebKit asked for with `configuration`
+    /// (its opener's, with its store, schemes, scripts and handlers).
+    fn popup(web: &WebView, configuration: &WKWebViewConfiguration, mtm: MainThreadMarker) -> Self {
+        let observer = Observer::new(web, mtm);
+        let page = Self::made(web, observer, configuration, Vec::new(), true, mtm);
+        POPUP_PAGES.with(|pages| {
+            let mut pages = pages.borrow_mut();
+            pages.retain(|(view, _)| view.load().is_some());
+            pages.push((
+                Weak::from_retained(&page.view),
+                Weak::from_retained(&page.observer),
+            ));
+        });
+        page
+    }
+    fn made(
+        web: &WebView,
+        observer: Retained<Observer>,
+        configuration: &WKWebViewConfiguration,
+        schemes: Vec<Retained<SchemeServer>>,
+        popup: bool,
+        mtm: MainThreadMarker,
+    ) -> Self {
+        let options = web.options().clone();
+        // SAFETY: WKWebView's designated initializer, on a fresh
+        // allocation of zgx's subclass, which adds no state.
+        let view: Retained<WKWebView> = unsafe {
             let view: Retained<ZgxWebView> = msg_send![
                 super(mtm.alloc::<ZgxWebView>().set_ivars(())),
                 initWithFrame: NSRect::ZERO,
-                configuration: &*configuration
+                configuration: configuration
             ];
             Retained::into_super(view)
         };
@@ -1147,6 +1360,7 @@ impl MacWebView {
             observer,
             _schemes: schemes,
             messages: options.messages,
+            popup,
             transparent: options.transparent,
             html: RefCell::new(None),
             zoom: Cell::new((1., 1.)),
@@ -1369,6 +1583,65 @@ impl WebViewBackend for MacWebView {
             );
         }
     }
+    fn snapshot(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
+        const SNAPSHOT_WIDTH: f64 = 800.0;
+        let done = Rc::new(Cell::new(Some(done)));
+        // SAFETY: WebKit calls the completion on the main thread with an
+        // NSImage or an NSError; the JPEG is made there from the image's
+        // TIFF data through NSBitmapImageRep, as a JPEG, all retained for the call.
+        let completion = block2::RcBlock::new(move |image: *mut AnyObject, error: *mut NSError| {
+            let result = unsafe {
+                if let Some(image) = image.as_ref() {
+                    let tiff: *mut NSData = msg_send![image, TIFFRepresentation];
+                    let rep: *mut AnyObject = match tiff.as_ref() {
+                        Some(tiff) => {
+                            msg_send![objc2::class!(NSBitmapImageRep), imageRepWithData: tiff]
+                        }
+                        None => std::ptr::null_mut(),
+                    };
+                    let jpeg: *mut NSData = match rep.as_ref() {
+                        Some(rep) => {
+                            let quality = NSNumber::new_f64(0.75);
+                            let key = NSString::from_str("NSImageCompressionFactor");
+                            let properties: *mut AnyObject = msg_send![
+                                objc2::class!(NSDictionary),
+                                dictionaryWithObject: &*quality,
+                                forKey: &*key
+                            ];
+                            msg_send![rep, representationUsingType: 3usize, properties: properties]
+                        }
+                        None => std::ptr::null_mut(),
+                    };
+                    match jpeg.as_ref() {
+                        Some(jpeg) => Ok(jpeg.to_vec()),
+                        None => Err("the page's picture couldn't be made a JPEG".to_string()),
+                    }
+                } else if let Some(error) = error.as_ref() {
+                    Err(error.localizedDescription().to_string())
+                } else {
+                    Err("WebKit gave no picture".to_string())
+                }
+            };
+            if let Some(done) = done.take() {
+                zgx::native_view::post(move || done(result));
+            }
+        });
+        unsafe {
+            let config: *mut AnyObject = msg_send![objc2::class!(WKSnapshotConfiguration), new];
+            if let Some(config) = config.as_ref() {
+                let width = NSNumber::new_f64(SNAPSHOT_WIDTH);
+                let _: () = msg_send![config, setSnapshotWidth: &*width];
+            }
+            let _: () = msg_send![
+                &*self.view,
+                takeSnapshotWithConfiguration: config,
+                completionHandler: &*completion
+            ];
+            if !config.is_null() {
+                let _: () = msg_send![config, release];
+            }
+        }
+    }
     fn clear_site_data(&self, url: &str, done: Box<dyn FnOnce(Result<usize, String>)>) {
         let Some(host) = zgx::web_view::site_host(url) else {
             return done(Err(format!("{url} has no site")));
@@ -1448,12 +1721,22 @@ impl Drop for MacWebView {
             }
             self.view.setNavigationDelegate(None);
             self.view.setUIDelegate(None);
-            let content = self.view.configuration().userContentController();
-            content.removeScriptMessageHandlerForName(&NSString::from_str(PRINT));
-            if self.messages {
-                content.removeScriptMessageHandlerForName(&NSString::from_str(CHANNEL));
+            if !self.popup {
+                let content = self.view.configuration().userContentController();
+                content.removeScriptMessageHandlerForName(&NSString::from_str(PRINT));
+                if self.messages {
+                    content.removeScriptMessageHandlerForName(&NSString::from_str(CHANNEL));
+                }
             }
             self.view.stopLoading();
+        }
+        if self.popup {
+            POPUP_PAGES.with(|pages| {
+                pages.borrow_mut().retain(|(view, _)| {
+                    view.load()
+                        .is_some_and(|view| !std::ptr::eq(&*view, &*self.view))
+                });
+            });
         }
         self.view.removeFromSuperview();
     }

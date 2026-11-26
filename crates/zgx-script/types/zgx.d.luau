@@ -1622,6 +1622,8 @@ declare extern type Web with
 	-- The pointer over the page, in points from its top left; nil outside.
 	-- (Over a page zgx hears no pointer moves: its nodes had their leave.)
 	pointer: { x: number, y: number }?
+	-- Ended (`close`): it shows no page again.
+	closed: boolean
 	function load(self, url: string): ()
 	function html(self, html: string, base_url: string?): ()
 	function back(self): ()
@@ -1645,6 +1647,16 @@ declare extern type Web with
 	-- hold until they reload. On Windows, storage of the site's other
 	-- subdomains stays.
 	function clear_site_data(self, url: string): Promise<number>
+	-- A JPEG of the page as it shows, about 800 points wide, base64; or
+	-- nil and why (it isn't showing yet).
+	function snapshot(self, reply: (jpeg_base64: string?, err: string?) -> ...unknown): ()
+	-- Windows its pages open (`window.open`, `target=_blank` links) as
+	-- pages of their own, made like this one and linked to it
+	-- (`window.opener`): show the popup (a tab) or close it. Without a
+	-- handler they reach `on_new_window` and open nothing. macOS only.
+	function on_popup(self, handler: (popup: Web, url: string) -> ...unknown): ()
+	-- The page asked to close (`window.close()` in a popup); `close` ends it.
+	function on_close(self, handler: () -> ...unknown): ()
 	-- A page from `ui.web(id, opts)` leaves the host's registry: the next
 	-- `ui.web(id)` makes a new one.
 	function close(self): ()
@@ -24075,6 +24087,7 @@ declare ui: {
 	-- `ui.web(opts)`: a page for this run. `ui.web(id, opts)`: the host's
 	-- page for `id`, made with `opts` the first time, kept across reloads.
 	web: ((opts: WebOptions?) -> Web) & ((id: string, opts: WebOptions?) -> Web),
+	web_cookie_domains: (profile: string?, reply: (list: { { domain: string, count: number } }?, err: string?) -> ...unknown) -> (),
 	terminal: (props: TerminalProps) -> Node,
 	-- A view the host made in Rust, mounted in this tree under its popups.
 	host_view: (props: HostViewProps) -> Node,

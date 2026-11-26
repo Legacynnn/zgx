@@ -211,6 +211,51 @@ fn guarded_web(
 }
 pub(crate) fn install_web(lua: &Lua, ui: &Table, webs: Rc<Webs>) -> mlua::Result<()> {
     ui.set(
+        "web_cookie_domains",
+        lua.create_function(|lua, (profile, reply): (Option<String>, Function)| {
+            use zgx::web_view::WebProfile;
+            let (vm, plugin) = {
+                let env = env(lua)?;
+                env.may(crate::Capability::Web, "ui.web_cookie_domains")?;
+                let plugin = match &*env.grants {
+                    crate::Grants::All => None,
+                    crate::Grants::Only(_) => Some(env.owner.clone()),
+                };
+                (env.vm.clone(), plugin)
+            };
+            let profile = match (profile.as_deref(), plugin) {
+                (None | Some("default"), None) => WebProfile::Default,
+                (Some("ephemeral"), _) => WebProfile::Ephemeral,
+                (Some(name), None) => WebProfile::Named(name.to_owned()),
+                (None | Some("default"), Some(plugin)) => {
+                    WebProfile::Named(format!("plugin:{plugin}"))
+                }
+                (Some(name), Some(plugin)) => WebProfile::Named(format!("plugin:{plugin}/{name}")),
+            };
+            zgx::web_view::cookie_domains(&profile, move |result| {
+                let Some(vm) = vm.upgrade() else {
+                    return;
+                };
+                let outcome = match result {
+                    Ok(domains) => vm
+                        .lua
+                        .create_sequence_from(domains.into_iter().filter_map(|(domain, count)| {
+                            let row = vm.lua.create_table().ok()?;
+                            row.set("domain", domain).ok()?;
+                            row.set("count", count).ok()?;
+                            Some(row)
+                        }))
+                        .and_then(|list| vm.call::<()>(&reply, (list, Value::Nil))),
+                    Err(error) => vm.call::<()>(&reply, (Value::Nil, error)),
+                };
+                if let Err(e) = outcome {
+                    vm.report(e);
+                }
+            });
+            Ok(())
+        })?,
+    )?;
+    ui.set(
         "web",
         lua.create_function(move |lua, (first, opts): (mlua::Value, Option<Table>)| {
             let plugin = {
@@ -292,6 +337,8 @@ impl UserData for WebUd {
         fields.add_field_method_get("can_go_forward", |_, w| Ok(w.0.can_go_forward()));
         fields.add_field_method_get("focused", |_, w| Ok(w.0.focused()));
         fields.add_field_method_get("error", |_, w| Ok(w.0.state().get().error));
+        // Closed (`web:close()`): it shows no page again.
+        fields.add_field_method_get("closed", |_, w| Ok(w.0.is_closed()));
         fields.add_field_method_get("full_screen", |_, w| {
             Ok(w.0.state().with(|state| state.full_screen))
         });
@@ -337,6 +384,41 @@ impl UserData for WebUd {
                 webs.0.borrow_mut().remove(&key.id);
             }
             w.0.close();
+            Ok(())
+        });
+        // `web:on_popup(function(popup, url) … end)`: windows its pages open
+        // (`window.open`, `target=_blank`) arrive as pages of their own,
+        // linked to this one (`window.opener`), to show (a tab) or close.
+        methods.add_method("on_popup", |lua, w, handler: Function| {
+            let vm = env(lua)?.vm.clone();
+            w.0.set_popup_handler(move |popup, request| {
+                let Some(vm) = vm.upgrade() else {
+                    return popup.close();
+                };
+                vm.runtime.clone().batch(|| {
+                    let called = vm
+                        .lua
+                        .create_userdata(WebUd(popup, None))
+                        .and_then(|popup| vm.call::<()>(&handler, (popup, request.url)));
+                    if let Err(e) = called {
+                        vm.report(e);
+                    }
+                });
+            });
+            Ok(())
+        });
+        // `web:on_close(function() … end)`: the page asked to close
+        // (`window.close()` in a popup); `web:close()` ends it.
+        methods.add_method("on_close", |lua, w, handler: Function| {
+            let vm = env(lua)?.vm.clone();
+            w.0.set_close_handler(move || {
+                let Some(vm) = vm.upgrade() else { return };
+                vm.runtime.clone().batch(|| {
+                    if let Err(e) = vm.call::<()>(&handler, ()) {
+                        vm.report(e);
+                    }
+                });
+            });
             Ok(())
         });
         methods.add_method("forward", |_, w, ()| {
@@ -387,6 +469,27 @@ impl UserData for WebUd {
                     Err(error) => {
                         vm.call_as::<()>("the reply function", &reply, (Value::Nil, error))
                     }
+                };
+                if let Err(e) = outcome {
+                    vm.report(e);
+                }
+            });
+            Ok(())
+        });
+        // `web:snapshot(function(jpeg_base64, err) … end)`: the page as it shows.
+        methods.add_method("snapshot", |lua, w, reply: Function| {
+            let vm = env(lua)?.vm.clone();
+            w.0.snapshot(move |result| {
+                let Some(vm) = vm.upgrade() else {
+                    return;
+                };
+                let outcome = match result {
+                    Ok(jpeg) => {
+                        use base64::Engine as _;
+                        let text = base64::engine::general_purpose::STANDARD.encode(jpeg);
+                        vm.call::<()>(&reply, (text, mlua::Value::Nil))
+                    }
+                    Err(error) => vm.call::<()>(&reply, (Value::Nil, error)),
                 };
                 if let Err(e) = outcome {
                     vm.report(e);

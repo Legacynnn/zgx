@@ -1142,6 +1142,8 @@ impl Application {
         // 300 on an RTX 4090), and this put the first content 16 to 24 ms
         // sooner. Linux makes it with the first window, as it chooses an
         // adapter by its surface (and GL needs its display).
+        #[cfg(target_os = "macos")]
+        crate::native_host::install_cookie_store();
         #[cfg(any(target_os = "macos", windows))]
         let early_gpu = zgx_gpu::GpuContext::prepare_in_background();
         let mut event_loop = EventLoop::<Event>::with_user_event();
